@@ -191,7 +191,7 @@ struct retro_core_option_v2_definition option_defs_us[] = {
 #ifdef HAVE_CDROM
       "Affects both physical CD-ROM and CD images. "
 #endif
-#if !defined(_3DS) && !defined(VITA)
+#if !defined(_3DS) && !defined(VITA) && !defined(MIYOOMINI)
       "333000 will try to read the complete disk (requires an additional 750MB of RAM)."
 #endif
       ,
@@ -201,7 +201,7 @@ struct retro_core_option_v2_definition option_defs_us[] = {
          V(0),  V(1),  V(2),  V(3),  V(4),  V(5),  V(6),  V(7),
          V(8),  V(9),  V(10), V(11), V(12), V(13), V(14), V(15),
          V(16), V(32), V(64), V(128), V(256), V(512), V(1024),
-#if !defined(_3DS) && !defined(VITA)
+#if !defined(_3DS) && !defined(VITA) && !defined(MIYOOMINI)
          V(333000),
 #endif
          { NULL, NULL},

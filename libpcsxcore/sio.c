@@ -88,7 +88,8 @@ static unsigned int mcdst, rdwr;
 static unsigned char adrH, adrL;
 static unsigned int padst;
 
-char Mcd1Data[MCD_SIZE], Mcd2Data[MCD_SIZE];
+char Mcd1Store[MCD_SIZE], Mcd2Store[MCD_SIZE];
+char *Mcd1Data = Mcd1Store, *Mcd2Data = Mcd2Store;
 
 unsigned char McdDisable[2];
 unsigned char McdFlag[2];
@@ -789,9 +790,12 @@ int sioFreeze(void *f, int Mode) {
 		CtrlReg = SWAPu16(CtrlReg_);
 		BaudReg = SWAPu16(BaudReg_);
 		// card likely changed since the state save,
-		// let the game know
-		McdFlag[0] |= 8;
-		McdFlag[1] |= 8;
+		// let the game know (not for netplay rollbacks: the card
+		// didn't change and peers roll back a different number of times)
+		if (!SaveStateNetplay) {
+			McdFlag[0] |= 8;
+			McdFlag[1] |= 8;
+		}
 	}
 
 	return 0;

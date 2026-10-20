@@ -33,7 +33,11 @@ extern "C" {
 
 #define MCD_SIZE	(1024 * 8 * 16)
 
-extern char Mcd1Data[MCD_SIZE], Mcd2Data[MCD_SIZE];
+// The cards' memory. The emulated machine uses Mcd1Data/Mcd2Data, which
+// normally point to the cards of this console (the store, what the
+// frontend saves); netplay can point them elsewhere for a while.
+extern char Mcd1Store[MCD_SIZE], Mcd2Store[MCD_SIZE];
+extern char *Mcd1Data, *Mcd2Data;
 
 extern unsigned char McdDisable[2];
 extern unsigned char McdFlag[2];

@@ -454,6 +454,10 @@ OBJS += deps/libretro-common/time/rtime.o
 CFLAGS += -DUSE_LIBRETRO_VFS
 endif
 OBJS += frontend/libretro.o
+ifeq "$(NETPLAY_LOCKSTEP)" "1"
+OBJS += frontend/netplay_lockstep.o
+frontend/libretro.o: CFLAGS += -DNETPLAY_LOCKSTEP
+endif
 CFLAGS += -DHAVE_LIBRETRO
 INC_LIBRETRO_COMMON := 1
 

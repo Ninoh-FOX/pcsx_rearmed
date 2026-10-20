@@ -65,6 +65,10 @@ int CheckCdrom();
 int CheckResetManualExe();
 int Load(const char *ExePath);
 
+// Set by the frontend while it serializes for netplay rollback: the state
+// must then be identical on every peer, so host-specific data is left out.
+extern int SaveStateNetplay;
+
 int SaveState(const char *file);
 int LoadState(const char *file);
 int CheckState(const char *file);

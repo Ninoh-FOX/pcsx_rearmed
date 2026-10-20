@@ -51,6 +51,16 @@
 
 #include <libretro.h>
 #include "libretro_core_options.h"
+#ifdef NETPLAY_LOCKSTEP
+#include "netplay_lockstep.h"
+static int lsk_saved_in_type[8];
+static unsigned lsk_saved_frameskip_type;
+#else
+static inline bool lsk_running(void) { return false; }
+static inline bool lsk_busy(void) { return false; }
+#endif
+static void show_notification(const char *msg_str,
+      unsigned duration_ms, unsigned priority, enum retro_log_level level);
 
 #ifdef USE_LIBRETRO_VFS
 #include <streams/file_stream_transforms.h>
@@ -116,6 +126,9 @@ static int vout_width = 256, vout_height = 240, vout_pitch_b = 256*2;
 static int vout_fb_dirty;
 static int psx_w, psx_h;
 static bool vout_can_dupe;
+// frontend won't show this frame (netplay rollback replay, runahead)
+static int vout_skip_blit;
+static int vout_clear_pending;
 static int display_internal_fps;
 static bool libretro_supports_bitmasks = false;
 static bool libretro_supports_option_categories = false;
@@ -212,7 +225,6 @@ static bool axis_bounds_modifier;
 
 //Dummy functions
 bool retro_load_game_special(unsigned game_type, const struct retro_game_info *info, size_t num_info) { return false; }
-void retro_unload_game(void) {}
 static int vout_open(void) { return 0; }
 static void vout_close(void) {}
 static int snd_init(void) { return 0; }
@@ -427,6 +439,16 @@ static void vout_flip(const void *vram_, int vram_ofs, int bgr24,
    int w_blit = min(w, vout_width);
    int port = 0, hwrapped;
    int sstride = 2048;
+
+   if (vout_skip_blit) {
+      // nobody will see it, only keep note to clear the borders later
+      vout_clear_pending |= dims_changed;
+      goto out;
+   }
+   if (vout_clear_pending) {
+      dims_changed = 1;
+      vout_clear_pending = 0;
+   }
 
    if (vram == NULL || dims_changed || (in_enable_crosshair[0] + in_enable_crosshair[1]) > 0)
    {
@@ -810,6 +832,13 @@ void plat_trigger_vibrate(int pad, int low, int high)
 {
    if (!rumble_cb)
       return;
+#ifdef NETPLAY_LOCKSTEP
+   if (lsk_running()) {
+      if (pad != lsk_local_port())
+         return;
+      pad = 0;
+   }
+#endif
 
    if (in_enable_vibration)
    {
@@ -1173,42 +1202,46 @@ static void update_multitap(void)
    }
 }
 
+static int device_to_pad_type(unsigned device)
+{
+   switch (device)
+   {
+   case RETRO_DEVICE_JOYPAD:
+   case RETRO_DEVICE_PSE_STANDARD:
+      return PSE_PAD_TYPE_STANDARD;
+   case RETRO_DEVICE_PSE_ANALOG:
+      return PSE_PAD_TYPE_ANALOGJOY;
+   case RETRO_DEVICE_PSE_DUALSHOCK:
+      return PSE_PAD_TYPE_ANALOGPAD;
+   case RETRO_DEVICE_PSE_MOUSE:
+      return PSE_PAD_TYPE_MOUSE;
+   case RETRO_DEVICE_PSE_NEGCON:
+      return PSE_PAD_TYPE_NEGCON;
+   case RETRO_DEVICE_PSE_GUNCON:
+      return PSE_PAD_TYPE_GUNCON;
+   case RETRO_DEVICE_PSE_JUSTIFIER:
+      return PSE_PAD_TYPE_GUN;
+   case RETRO_DEVICE_NONE:
+   default:
+      return PSE_PAD_TYPE_NONE;
+   }
+}
+
 void retro_set_controller_port_device(unsigned port, unsigned device)
 {
    int in_type_old;
    if (port >= PORTS_NUMBER)
       return;
 
-   in_type_old = in_type[port];
-   switch (device)
-   {
-   case RETRO_DEVICE_JOYPAD:
-   case RETRO_DEVICE_PSE_STANDARD:
-      in_type[port] = PSE_PAD_TYPE_STANDARD;
-      break;
-   case RETRO_DEVICE_PSE_ANALOG:
-      in_type[port] = PSE_PAD_TYPE_ANALOGJOY;
-      break;
-   case RETRO_DEVICE_PSE_DUALSHOCK:
-      in_type[port] = PSE_PAD_TYPE_ANALOGPAD;
-      break;
-   case RETRO_DEVICE_PSE_MOUSE:
-      in_type[port] = PSE_PAD_TYPE_MOUSE;
-      break;
-   case RETRO_DEVICE_PSE_NEGCON:
-      in_type[port] = PSE_PAD_TYPE_NEGCON;
-      break;
-   case RETRO_DEVICE_PSE_GUNCON:
-      in_type[port] = PSE_PAD_TYPE_GUNCON;
-      break;
-   case RETRO_DEVICE_PSE_JUSTIFIER:
-      in_type[port] = PSE_PAD_TYPE_GUN;
-      break;
-   case RETRO_DEVICE_NONE:
-   default:
-      in_type[port] = PSE_PAD_TYPE_NONE;
-      break;
+#ifdef NETPLAY_LOCKSTEP
+   if (lsk_running()) {
+      // the pads are fixed while linked, this applies afterwards
+      lsk_saved_in_type[port] = device_to_pad_type(device);
+      return;
    }
+#endif
+   in_type_old = in_type[port];
+   in_type[port] = device_to_pad_type(device);
 
    if (in_type[port] != in_type_old) {
        SysPrintf("port: %u  device: %s\n", port + 1, get_pse_pad_label[in_type[port]]);
@@ -1243,12 +1276,99 @@ void retro_get_system_av_info(struct retro_system_av_info *info)
    info->geometry.aspect_ratio   = 4.0 / 3.0;
 }
 
+/* netplay
+ * Any savestate taken in the netplay context means netplay is in use (with
+ * rollback that's every frame, a lockstep frontend does it at least once to
+ * check that the peers are in sync). Keep the emulation deterministic from
+ * then on until the game is unloaded: with the dynarec compile thread,
+ * blocks run in the interpreter until compiled, and when that happens
+ * depends on host thread timing, so peers would drift apart. */
+
+#if !defined(DRC_DISABLE) && !defined(LIGHTREC) && defined(NDRC_THREAD)
+#define NDRC_THREAD_FLAGS (NDHACK_THREAD_FORCE | NDHACK_THREAD_FORCE_ON)
+static int netplay_drc_override;
+static u32 netplay_drc_saved_flags;
+
+static void netplay_drc_apply(void)
+{
+   if (psxCpu && psxCpu->ApplyConfig)
+      psxCpu->ApplyConfig();
+}
+
+// called after the option is read, so that it can't restart the thread
+static void netplay_drc_thread_keep_off(void)
+{
+   if (!netplay_drc_override)
+      return;
+   netplay_drc_saved_flags = ndrc_g.hacks & NDRC_THREAD_FLAGS;
+   ndrc_g.hacks = (ndrc_g.hacks & ~NDRC_THREAD_FLAGS) | NDHACK_THREAD_FORCE;
+}
+
+static void netplay_drc_thread_off(void)
+{
+   if (netplay_drc_override)
+      return;
+   netplay_drc_override = 1;
+   netplay_drc_saved_flags = ndrc_g.hacks & NDRC_THREAD_FLAGS;
+   if ((ndrc_g.hacks & NDRC_THREAD_FLAGS) == NDHACK_THREAD_FORCE)
+      return; // already off by option
+   ndrc_g.hacks = (ndrc_g.hacks & ~NDRC_THREAD_FLAGS) | NDHACK_THREAD_FORCE;
+   netplay_drc_apply();
+   SysPrintf("netplay detected: dynarec thread disabled\n");
+}
+
+static void netplay_drc_thread_restore(void)
+{
+   u32 old;
+   if (!netplay_drc_override)
+      return;
+   netplay_drc_override = 0;
+   old = ndrc_g.hacks & NDRC_THREAD_FLAGS;
+   ndrc_g.hacks = (ndrc_g.hacks & ~NDRC_THREAD_FLAGS) | netplay_drc_saved_flags;
+   if (old != netplay_drc_saved_flags) {
+      netplay_drc_apply();
+      SysPrintf("netplay ended: dynarec thread setting restored\n");
+   }
+}
+#else
+static void netplay_drc_thread_keep_off(void) {}
+static void netplay_drc_thread_off(void) {}
+static void netplay_drc_thread_restore(void) {}
+#endif
+
+static void netplay_seen(void)
+{
+   netplay_drc_thread_off();
+}
+
+void retro_unload_game(void)
+{
+   netplay_drc_thread_restore();
+}
+
+// it's currently 4380651-4397047 bytes, but have some reserved for future
+#define SAVESTATE_SIZE 0x440000
+
+static int savestate_ctx_is_netplay(void)
+{
+   int ctx = RETRO_SAVESTATE_CONTEXT_NORMAL;
+   if (!environ_cb || !environ_cb(RETRO_ENVIRONMENT_GET_SAVESTATE_CONTEXT, &ctx))
+      return 0;
+   return ctx == RETRO_SAVESTATE_CONTEXT_ROLLBACK_NETPLAY;
+}
+
 /* savestates */
 size_t retro_serialize_size(void)
 {
-   // it's currently 4380651-4397047 bytes,
-   // but have some reserved for future
-   return 0x440000;
+#ifdef NETPLAY_LOCKSTEP
+   // Netplay goes through the netpacket interface (lockstep), the frontend
+   // keeps no savestates for it. Tell it so: RetroArch for the Miyoo Mini
+   // sizes its netplay buffers from this and refuses big states.
+   if (savestate_ctx_is_netplay())
+      return 0;
+#endif
+
+   return SAVESTATE_SIZE;
 }
 
 struct save_fp
@@ -1320,7 +1440,7 @@ static long save_seek(void *file, long offs, int whence)
 static void save_close(void *file)
 {
    struct save_fp *fp = file;
-   size_t r_size = retro_serialize_size();
+   size_t r_size = SAVESTATE_SIZE;
    if (fp == NULL)
       return;
 
@@ -1336,11 +1456,23 @@ struct PcsxSaveFuncs SaveFuncs = {
 	save_open, save_read, save_write, save_seek, save_close
 };
 
+static int savestate_is_netplay(void)
+{
+   if (!savestate_ctx_is_netplay())
+      return 0;
+   netplay_seen();
+   return 1;
+}
+
 bool retro_serialize(void *data, size_t size)
 {
    int ret;
+   if (size < SAVESTATE_SIZE)
+      return false;
    CdromFrontendId = disk_current_index;
+   SaveStateNetplay = savestate_is_netplay();
    ret = SaveState(data);
+   SaveStateNetplay = 0;
 
    // old3ds tends to oom here, so log
    log_mem_usage(1);
@@ -1352,8 +1484,15 @@ static bool disk_set_image_index(unsigned int index);
 bool retro_unserialize(const void *data, size_t size)
 {
    int ret;
+   if (lsk_busy()) {
+      show_notification("Netplay: savestates can't be loaded while linked",
+            3000, 1, RETRO_LOG_WARN);
+      return false;
+   }
    CdromFrontendId = -1;
+   SaveStateNetplay = savestate_is_netplay();
    ret = LoadState(data);
+   SaveStateNetplay = 0;
    if (ret)
       return false;
    if (CdromFrontendId != -1 && CdromFrontendId != disk_current_index)
@@ -1371,6 +1510,9 @@ void retro_cheat_set(unsigned index, bool enabled, const char *code)
 {
    int ret = -1;
    char *buf;
+
+   if (lsk_busy())
+      return; // both consoles must run the same machine
 
    // cheat funcs are destructive, need a copy...
    buf = strdup(code);
@@ -1480,6 +1622,11 @@ static void disk_init(void)
 
 static bool disk_set_eject_state(bool ejected)
 {
+   if (lsk_busy() && ejected != disk_ejected) {
+      show_notification("Netplay: discs can't be changed while linked",
+            3000, 1, RETRO_LOG_WARN);
+      return false;
+   }
    if (ejected != disk_ejected)
       SysPrintf("new eject_state: %d\n", ejected);
 
@@ -1515,6 +1662,8 @@ static unsigned int disk_get_image_index(void)
 static bool disk_set_image_index(unsigned int index)
 {
    if (index > disk_count)
+      return false;
+   if (lsk_busy() && index != disk_current_index)
       return false;
 
    CdromId[0] = '\0';
@@ -2228,8 +2377,9 @@ void *retro_get_memory_data(unsigned id)
    case RETRO_MEMORY_SYSTEM_RAM:
       return psxRegs.ptrs.psxM;
    case RETRO_MEMORY_SAVE_RAM:
+      // this console's own card, also while netplay plays with the host's
       if (memcard_type[0] == MEMCARDTYPE_LIBRETRO)
-         return Mcd1Data;
+         return Mcd1Store;
    }
    return NULL;
 }
@@ -2576,6 +2726,7 @@ static void update_variables(bool in_flight)
       else if (strcmp(var.value, "enabled") == 0)
          ndrc_g.hacks |= NDHACK_THREAD_FORCE | NDHACK_THREAD_FORCE_ON;
       // psxCpu->ApplyConfig(); will start/stop the thread
+      netplay_drc_thread_keep_off();
    }
 #endif
 
@@ -3076,6 +3227,14 @@ static void update_variables(bool in_flight)
    }
 #endif
 
+#ifdef NETPLAY_LOCKSTEP
+   if (lsk_running()) {
+      // frameskip can change what the game sees, it waits for the link's end
+      lsk_saved_frameskip_type = frameskip_type;
+      frameskip_type = FRAMESKIP_NONE;
+   }
+#endif
+
    if (in_flight)
    {
       // inform core things about possible config changes
@@ -3095,6 +3254,11 @@ static void update_variables(bool in_flight)
    }
 
    update_option_visibility();
+
+#ifdef NETPLAY_LOCKSTEP
+   if (in_flight && lsk_running())
+      lsk_check_config();
+#endif
 
    if (in_flight && old_fps != psxGetFps())
    {
@@ -3353,8 +3517,10 @@ static void update_input(void)
    int i;
    int j;
 
+   int nports = lsk_running() ? 1 : PORTS_NUMBER;
+
    // reset all keystate, query libretro for keystate
-   for (i = 0; i < PORTS_NUMBER; i++)
+   for (i = 0; i < nports; i++)
    {
       int32_t ret = 0;
       int type = in_type[i];
@@ -3398,6 +3564,16 @@ static void update_input(void)
          if (type == PSE_PAD_TYPE_ANALOGPAD && in_dualshock_analog_combo != 0
              && ret == in_dualshock_analog_combo)
          {
+#ifdef NETPLAY_LOCKSTEP
+            if (lsk_running())
+            {
+               // both consoles must toggle it on the same frame
+               if (!in_dualshock_toggling)
+                  lsk_request_analog_toggle();
+               in_dualshock_toggling = true;
+               return;
+            }
+#endif
             if (!in_dualshock_toggling)
             {
                int state = padToggleAnalog(i);
@@ -3499,18 +3675,190 @@ static void print_internal_fps(void)
 static bool get_bios_config_hle(void);
 static void prepare_bios(bool use_hle);
 
+static void core_reset(void)
+{
+   prepare_bios(get_bios_config_hle());
+   SysReset();
+   if (CheckResetManualExe())
+      ;
+   else if (Config.HLE)
+      LoadCdromMainExe(NULL);
+}
+
+/* A reset that leaves the machine as if just powered on. A plain reset
+ * keeps what the real hardware keeps (RAM, VRAM, sound RAM) and also some
+ * emulator state (frame counter, SPU internals), so two consoles that were
+ * running different things wouldn't be identical after it. Netplay resets
+ * both consoles with this, they must then compute the very same frames. */
+void core_power_on_reset(void)
+{
+   static union {
+      SPUFreeze_t hdr;
+      u8 buf[sizeof(SPUFreeze_t) + SPUFREEZE_F2_MAX_SIZE];
+   } spu_zero;
+   unsigned short *spuram = NULL;
+   uint16_t *vram = NULL;
+   GPUFreeze_t gpu_hdr;
+
+   // finish what the GPU/SPU threads have queued
+   memset(&gpu_hdr, 0, sizeof(gpu_hdr));
+   gpu_hdr.ulFreezeVersion = 1;
+   GPU_freeze(1, &gpu_hdr, &vram);
+
+   frame_counter = 0;
+   psxRegs.cycle = 0;
+   memset(psxRegs.ptrs.psxM, 0, 0x200000);
+   if (vram)
+      memset(vram, 0, 1024 * 512 * 2);
+   GPU_writeStatus(0); // GP1(00h): reset the GPU
+
+   memset(&spu_zero, 0, sizeof(spu_zero));
+   strcpy(spu_zero.hdr.PluginName, "PBOSS");
+   spu_zero.hdr.PluginVersion = 5;
+   spu_zero.hdr.Size = sizeof(SPUFreeze_t) + 512 * 1024 + SPUFREEZE_F2_MAX_SIZE;
+   SPU_freeze(0, NULL, &spuram, NULL, 0);
+   if (spuram) {
+      memset(spuram, 0, 512 * 1024);
+      SPU_freeze(0, &spu_zero.hdr, &spuram,
+            spu_zero.buf + sizeof(SPUFreeze_t), 0);
+   }
+
+   core_reset();
+}
+
+#ifdef NETPLAY_LOCKSTEP
+/* glue for netplay_lockstep.c */
+static int lsk_supported_pad_type(int t)
+{
+   // only pads: what a gun or mouse reads isn't sent over the link
+   if (t == PSE_PAD_TYPE_ANALOGJOY || t == PSE_PAD_TYPE_ANALOGPAD)
+      return t;
+   return PSE_PAD_TYPE_STANDARD;
+}
+
+int lsk_core_local_pad_type(void)
+{
+   return lsk_supported_pad_type(lsk_running() ? lsk_saved_in_type[0] : in_type[0]);
+}
+
+void lsk_core_reset(void)
+{
+   core_reset();
+}
+
+void lsk_core_message(const char *msg, unsigned ms)
+{
+   show_notification(msg, ms, 3, RETRO_LOG_INFO);
+}
+
+const char *lsk_core_build_id(void)
+{
+   // the very same build on both: same emulation, same dynarec output
+   return "pcsxr " GIT_VERSION " " __DATE__ " " __TIME__;
+}
+
+static uint32_t lsk_fnv(uint32_t h, const void *data, size_t len)
+{
+   const uint8_t *p = data;
+   while (len--)
+      h = (h ^ *p++) * 16777619u;
+   return h;
+}
+
+uint32_t lsk_core_game_hash(void)
+{
+   uint32_t h = 2166136261u;
+   h = lsk_fnv(h, CdromId, sizeof(CdromId));
+   h = lsk_fnv(h, CdromLabel, sizeof(CdromLabel));
+   h = lsk_fnv(h, &disk_current_index, sizeof(disk_current_index));
+   h = lsk_fnv(h, &disk_count, sizeof(disk_count));
+   return h;
+}
+
+uint32_t lsk_core_bios_hash(void)
+{
+   if (Config.HLE)
+      return 0x484c45; // "HLE", built into the core
+   return lsk_fnv(2166136261u, psxRegs.ptrs.psxR, 0x80000);
+}
+
+uint32_t lsk_core_cfg_hash(void)
+{
+   // everything that changes what the emulated machine does
+   uint32_t v[] = {
+      Config.Xa, Config.Mdec, Config.Cdda, Config.SlowBoot,
+      Config.icache_emulation, Config.DisableStalls, Config.PreciseExceptions,
+      Config.TurboCD, (uint32_t)Config.cycle_multiplier,
+      (uint32_t)Config.GpuListWalking, (uint32_t)Config.FractionalFramerate,
+      (uint32_t)Config.AlternativeFlip, Config.Cpu, Config.PsxType,
+      Config.PsxRegion, (uint32_t)pl_rearmed_cbs.dithering,
+      (uint32_t)multitap1, (uint32_t)multitap2, (uint32_t)in_enable_vibration,
+      (uint32_t)spu_config.iUseThread,
+#if !defined(DRC_DISABLE) && !defined(LIGHTREC)
+      ndrc_g.hacks & ~(NDHACK_THREAD_FORCE | NDHACK_THREAD_FORCE_ON),
+#endif
+   };
+   return lsk_fnv(2166136261u, v, sizeof(v));
+}
+
+void lsk_core_session_begin(int pad1_type, int pad2_type)
+{
+   int i;
+   memcpy(lsk_saved_in_type, in_type, sizeof(lsk_saved_in_type));
+   in_type[0] = pad1_type;
+   in_type[1] = pad2_type;
+   for (i = 2; i < PORTS_NUMBER; i++)
+      in_type[i] = PSE_PAD_TYPE_NONE;
+   padChanged();
+
+   lsk_saved_frameskip_type = frameskip_type;
+   frameskip_type = FRAMESKIP_NONE;
+   pl_rearmed_cbs.fskip_force = 0;
+   retro_set_audio_buff_status_cb();
+
+   netplay_drc_thread_off();
+   if (!disk_ejected)
+      SetCdOpenCaseTime(0); // that one goes by the wall clock
+}
+
+void lsk_core_session_end(void)
+{
+   memcpy(in_type, lsk_saved_in_type, sizeof(lsk_saved_in_type));
+   padChanged();
+   frameskip_type = lsk_saved_frameskip_type;
+   retro_set_audio_buff_status_cb();
+   netplay_drc_thread_restore();
+}
+
+void lsk_core_analog_toggle(int port)
+{
+   int state = padToggleAnalog(port);
+   if (port == lsk_local_port())
+      show_notification(state ? "ANALOG ON" : "ANALOG OFF", 800, 1, RETRO_LOG_INFO);
+}
+#endif
+
 void retro_run(void)
 {
    //SysReset must be run while core is running,Not in menu (Locks up Retroarch)
    if (reset_pending)
    {
       reset_pending = false;
-      prepare_bios(get_bios_config_hle());
-      SysReset();
-      if (CheckResetManualExe())
-         ;
-      else if (Config.HLE)
-         LoadCdromMainExe(NULL);
+#ifdef NETPLAY_LOCKSTEP
+      if (lsk_busy())
+         lsk_request_reset(); // both consoles reset on the same frame
+      else
+#endif
+      core_reset();
+   }
+
+   {
+      // bit0: video wanted. Off for netplay rollback replays, where
+      // converting the frame is wasted work.
+      int av = 3;
+      if (!environ_cb(RETRO_ENVIRONMENT_GET_AUDIO_VIDEO_ENABLE, &av))
+         av = 3;
+      vout_skip_blit = !(av & 1);
    }
 
    set_vout_fb();
@@ -3554,7 +3902,33 @@ void retro_run(void)
 
    input_poll_cb();
 
+#ifdef NETPLAY_LOCKSTEP
+   {
+      struct lsk_pad lp;
+      int pad1_type = in_type[0];
+
+      // read our pad as what we have, not what pad 1 is on the link
+      if (lsk_running())
+         in_type[0] = lsk_core_local_pad_type();
+      update_input();
+      in_type[0] = pad1_type;
+
+      lp.keys = in_keystate[0];
+      lp.axes[0] = in_analog_left[0][0];
+      lp.axes[1] = in_analog_left[0][1];
+      lp.axes[2] = in_analog_right[0][0];
+      lp.axes[3] = in_analog_right[0][1];
+      if (lsk_frame_begin(&lp) == LSK_SKIP)
+      {
+         // waiting for the other console: show the last frame again
+         video_cb(vout_can_dupe ? NULL : vout_buf_ptr,
+             vout_width, vout_height, vout_pitch_b);
+         return;
+      }
+   }
+#else
    update_input();
+#endif
 
    bool updated = false;
    if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE_UPDATE, &updated) && updated)
@@ -3578,6 +3952,9 @@ void retro_run(void)
    video_cb((vout_fb_dirty || !vout_can_dupe) ? vout_buf_ptr : NULL,
        vout_width, vout_height, vout_pitch_b);
    vout_fb_dirty = 0;
+#ifdef NETPLAY_LOCKSTEP
+   lsk_frame_end();
+#endif
 
 #ifdef HAVE_CDROM
    int inserted;
@@ -3996,6 +4373,9 @@ void retro_init(void)
 
    pl_rearmed_cbs.gpu_peops.dwActFixes = GPU_PEOPS_OLD_FRAME_SKIP;
 
+#ifdef NETPLAY_LOCKSTEP
+   lsk_init(environ_cb);
+#endif
    if (environ_cb(RETRO_ENVIRONMENT_GET_INPUT_BITMASKS, NULL))
       libretro_supports_bitmasks = true;
 
@@ -4005,6 +4385,10 @@ void retro_init(void)
 void retro_deinit(void)
 {
    size_t i;
+
+#ifdef NETPLAY_LOCKSTEP
+   lsk_deinit();
+#endif
 
    if (plugins_opened)
    {

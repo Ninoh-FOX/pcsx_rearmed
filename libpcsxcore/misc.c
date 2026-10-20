@@ -46,6 +46,7 @@ char CdromLabel[33] = "";
 int  CdromFrontendId; // for frontend use
 
 static u32 save_counter;
+int SaveStateNetplay;
 static char *manuallyLoadedExePath;
 
 // PSX Executable types
@@ -808,7 +809,8 @@ int SaveState(const char *file) {
 	misc->gpuSr = HW_GPU_STATUS;
 	misc->frame_counter = frame_counter;
 	misc->CdromFrontendId = CdromFrontendId;
-	misc->save_counter = ++save_counter;
+	// netplay: the number of saves differs between peers (rollbacks)
+	misc->save_counter = SaveStateNetplay ? save_counter : ++save_counter;
 	memset(misc->reserved, 0, sizeof(misc->reserved));
 
 	psxCpu->Notify(R3000ACPU_NOTIFY_BEFORE_SAVE, NULL);
@@ -865,7 +867,11 @@ int SaveState(const char *file) {
 	psxHwFreeze(f, 1);
 	psxRcntFreeze(f, 1);
 	mdecFreeze(f, 1);
-	ndrc_freeze(f, 1);
+	// the dynarec block list depends on this host's compile history, so it
+	// would make netplay CRCs differ; it's also costly to build every frame.
+	// Loading copes with it being absent.
+	if (!SaveStateNetplay)
+		ndrc_freeze(f, 1);
 	padFreeze(f, 1);
 
 	memset(misc, 0xff, sizeof(*misc));
