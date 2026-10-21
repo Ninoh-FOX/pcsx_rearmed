@@ -14,10 +14,13 @@ Mini has 128 MB and can't re-run frames anyway).
   linking). Saves made while linked go to the host's card. The client's own
   card isn't touched (also not by RetroArch's autosave) and is back when the
   session ends.
-- The input delay comes from the measured round trip (2 frames or more). If
-  the WiFi has a bad moment and a console has to wait for the other's pads,
-  that one sends its pads a frame earlier from then on (up to 4 more), one
-  less after a calm minute.
+- The input delay comes from the measured round trip (2 frames or more).
+- Both screens (and sounds) are kept within a frame of each other: two
+  consoles never run at exactly the same speed, so the one that gets a
+  frame ahead shows a frame twice (about once every 10 s).
+- If the WiFi has a bad moment and a console has to wait for the other's
+  pads, that one sends its pads a frame earlier from then on (up to 4
+  more), one less after a calm minute.
 - Every 2 seconds both consoles compare their PSX RAM; if they ever differ
   the link is cut with a message ("went out of sync") and each one goes on
   alone.

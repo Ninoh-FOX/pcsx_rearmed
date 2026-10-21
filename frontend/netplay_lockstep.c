@@ -30,8 +30,8 @@
 #include "../libpcsxcore/sio.h"
 
 #define LSK_MAGIC         0x4c585350u   /* "PSXL" */
-#define LSK_VERSION       1
-#define LSK_PROTOCOL      "pcsx_rearmed lockstep 1"
+#define LSK_VERSION       2
+#define LSK_PROTOCOL      "pcsx_rearmed lockstep 2"
 
 #define PK_HELLO          1
 #define PK_GIVEUP         2
@@ -60,6 +60,9 @@
 #define AHEAD_MAX         4             /* frames our pads may go earlier */
 #define AHEAD_GAP_US      1000000       /* between two of those */
 #define AHEAD_CALM_US     60000000      /* peer happy this long: one less */
+#define SYNC_EVERY        60            /* frames between clock comparisons */
+#define SYNC_HOLD         (3 * SYNC_EVERY) /* after a correction */
+#define ADV_NONE          ((int32_t)0x80000000)
 #define MCD_CHUNK         (16 * 1024)
 #define MCD_BLOB          (2 * MCD_SIZE)
 
@@ -117,6 +120,19 @@ static struct {
    uint32_t peer_stalls;    /* same, the peer's (comes with its pads) */
    uint32_t ahead;          /* our pads go this many frames earlier */
    uint64_t t_ahead;
+   uint64_t t_run;          /* when frame run_frame started running */
+   uint32_t run_frame;
+
+   /* time sync: how far each console runs ahead of the other. adv: our
+    * position when the peer's pads arrive minus its position when it sent
+    * them, that is how far ahead we are plus the trip; the peer's own adv
+    * is the trip minus that, so half the difference is what we're ahead. */
+   int32_t adv_min;         /* lowest adv seen in this window */
+   int32_t adv_report;      /* last window's: sent with our pads */
+   int32_t peer_adv;        /* the peer's adv_report */
+   uint32_t sync_hold;      /* no correction before this frame */
+   int repeat;              /* show this frame once more: we're ahead */
+   uint32_t repeats;
 } s;
 
 static uint64_t now_us(void)
@@ -124,6 +140,17 @@ static uint64_t now_us(void)
    struct timespec ts;
    clock_gettime(CLOCK_MONOTONIC, &ts);
    return (uint64_t)ts.tv_sec * 1000000u + ts.tv_nsec / 1000;
+}
+
+/* Where we are, in microseconds of emulated time: frames run so far plus
+ * how far into the current one. While we wait (or show a frame again)
+ * it doesn't move past the start of the next frame. */
+static uint32_t frame_pos(void)
+{
+   uint64_t in = now_us() - s.t_run;
+   if (in > FRAME_US)
+      in = FRAME_US;
+   return s.run_frame * (uint32_t)FRAME_US + (uint32_t)in;
 }
 
 static void set_state(int st)
@@ -268,12 +295,21 @@ static void run_prepare(void)
    s.peer_stalls = 0;
    s.ahead = 0;
    s.t_ahead = now_us();
+   s.t_run = now_us();
+   s.run_frame = (uint32_t)-1;
+   s.adv_min = INT32_MAX;
+   s.adv_report = ADV_NONE;
+   s.peer_adv = ADV_NONE;
+   s.sync_hold = SYNC_HOLD;
+   s.repeat = 0;
+   s.repeats = 0;
 }
 
 static uint32_t session_cfg;
 
 static void run_begin(void)
 {
+   s.t_run = now_us();
    ff_inhibit(true);
    lsk_core_session_begin(s.pad_type[0], s.pad_type[1]);
    core_power_on_reset();
@@ -315,8 +351,9 @@ static void host_send_cards_and_start(void)
 static uint32_t compute_delay(void)
 {
    uint64_t rtt = s.pongs ? s.rtt_sum / s.pongs : 2 * FRAME_US;
-   /* one way + 1.6 frames, rounded up */
-   uint32_t d = (uint32_t)((rtt / 2 + FRAME_US * 16 / 10 + FRAME_US - 1) / FRAME_US);
+   /* one way (packets are read once a frame: that is in it) + a frame,
+    * rounded up. The consoles are kept within a frame of each other. */
+   uint32_t d = (uint32_t)((rtt / 2 + FRAME_US + FRAME_US - 1) / FRAME_US);
    if (d < DELAY_MIN) d = DELAY_MIN;
    if (d > DELAY_MAX) d = DELAY_MAX;
    SysPrintf("netplay: rtt %u us over %u pings: delay %u\n",
@@ -403,8 +440,15 @@ static void on_input(const uint32_t *w, unsigned nw)
    uint32_t f, i;
    int who = s.is_host ? 1 : 0;
    if ((s.state != ST_RUN && s.state != ST_HOST_GO && s.state != ST_CLIENT_GO)
-         || nw < 5)
+         || nw < 7)
       return;
+   if (s.state == ST_RUN) {
+      int32_t adv = (int32_t)(frame_pos() - w[5]);
+      if (adv < s.adv_min)
+         s.adv_min = adv;
+   }
+   if ((int32_t)w[6] != ADV_NONE)
+      s.peer_adv = (int32_t)w[6];
    /* the peer had to wait for our pads: send them a frame earlier */
    if (w[4] > s.peer_stalls) {
       uint64_t t = now_us();
@@ -747,7 +791,7 @@ int lsk_frame_begin(const struct lsk_pad *local)
    /* our pad, for frame f + delay (+ more if the other console had to
     * wait for it: then it goes for a few frames at once) */
    while (s.sent <= f + s.delay + s.ahead) {
-      uint32_t w[5], sf = s.sent;
+      uint32_t w[7], sf = s.sent;
       i = sf % RING;
       s.pad[i][me] = *local;
       s.pad[i][me].keys = (local->keys & 0xffff) | s.pending_flags;
@@ -758,8 +802,17 @@ int lsk_frame_begin(const struct lsk_pad *local)
       w[2] = (uint16_t)s.pad[i][me].axes[0] | ((uint32_t)(uint16_t)s.pad[i][me].axes[1] << 16);
       w[3] = (uint16_t)s.pad[i][me].axes[2] | ((uint32_t)(uint16_t)s.pad[i][me].axes[3] << 16);
       w[4] = s.stalls;
-      send_pk(PK_INPUT, w, 5, NULL, 0);
+      w[5] = frame_pos();
+      w[6] = (uint32_t)s.adv_report;
+      send_pk(PK_INPUT, w, 7, NULL, 0);
       s.sent = sf + 1;
+   }
+
+   /* we run ahead of the other console: show this frame once more, so
+    * both screens (and sounds) go together */
+   if (s.repeat) {
+      s.repeat = 0;
+      return LSK_SKIP;
    }
 
    i = f % RING;
@@ -794,6 +847,8 @@ int lsk_frame_begin(const struct lsk_pad *local)
       }
    }
 
+   s.t_run = now_us();
+   s.run_frame = f;
    apply_pads(i);
    flags = s.pad[i][0].keys | s.pad[i][1].keys;
    if (flags & LSK_KEY_RESET)
@@ -820,15 +875,41 @@ static uint32_t ram_hash(void)
    return h;
 }
 
+/* Once a window: are we ahead of the other console? The estimate is good
+ * to about half a frame (packets are read once per frame), so a frame is
+ * repeated only when we're a whole frame ahead by it. */
+static void time_sync(void)
+{
+   int32_t ahead_us;
+   s.adv_report = s.adv_min != INT32_MAX ? s.adv_min : ADV_NONE;
+   s.adv_min = INT32_MAX;
+   if (s.adv_report == ADV_NONE || s.peer_adv == ADV_NONE
+         || (int32_t)(s.frame - s.sync_hold) < 0)
+      return;
+   ahead_us = (int32_t)(((int64_t)s.adv_report - s.peer_adv) / 2);
+   if (ahead_us >= FRAME_US) {
+      s.repeat = 1;
+      s.repeats++;
+      /* until both sides measured after it */
+      s.sync_hold = s.frame + SYNC_HOLD;
+      SysPrintf("netplay: %d us ahead of the other console, a frame again (%u)\n",
+            ahead_us, s.repeats);
+   }
+}
+
 void lsk_frame_end(void)
 {
    if (s.state != ST_RUN)
       return;
    s.frame++;
+   if (s.frame % SYNC_EVERY == 0)
+      time_sync();
    if (s.frame % HASH_EVERY == 0) {
       uint32_t w[2];
       w[0] = s.frame;
       w[1] = ram_hash();
+      SysPrintf("netplay: frame %u ran at %llu us, ahead %u\n", s.frame,
+            (unsigned long long)s.t_run, s.ahead);
       send_pk(PK_HASH, w, 2, NULL, 0);
       hash_store(0, w[0], w[1]);
    }
