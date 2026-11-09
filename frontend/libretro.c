@@ -4250,7 +4250,25 @@ static void loadPSXBios(void)
       unsigned i;
       snprintf(Config.BiosDir, sizeof(Config.BiosDir), "%s", dir);
 
-      for (i = 0; i < ARRAY_SIZE(listed_bios); i++)
+      /* romw.bin (the PlayStation Classic's BIOS) comes first, for games
+       * of every region, as on that console; without it (or if it is not
+       * a valid BIOS) the usual order follows. */
+      snprintf(path, sizeof(path), "%s%cromw.bin", dir, SLASH);
+      try_use_bios(path, sizeof(path), true, true);
+      for (i = 0; i < ARRAY_SIZE(bios_saved); i++)
+         if (bios_saved[i] && !strcmp(bios_saved[i], "romw.bin"))
+            break;
+      if (i < ARRAY_SIZE(bios_saved))
+      {
+         for (i = 0; i < ARRAY_SIZE(bios_saved); i++)
+         {
+            free(bios_saved[i]);
+            bios_saved[i] = strdup("romw.bin");
+         }
+         SysPrintf("using romw.bin for every region\n");
+      }
+
+      for (i = 0; i < ARRAY_SIZE(listed_bios) && !have_all_bios(); i++)
       {
          snprintf(path, sizeof(path), "%s%c%s.bin", dir, SLASH, listed_bios[i]);
          try_use_bios(path, sizeof(path), true, true);
@@ -4258,7 +4276,7 @@ static void loadPSXBios(void)
             break;
       }
 
-      if (i == ARRAY_SIZE(listed_bios))
+      if (!have_all_bios())
          find_any_bios(dir, path, sizeof(path));
    }
 
